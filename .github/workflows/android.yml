@@ -16,100 +16,33 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Java
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Extract Uploaded ZIP Automatically
-        shell: bash
+      - name: Check uploaded HTML
+        run: |
+          set -e
+          test -f index.html || {
+            echo "::error::Upload index.html to the repository root."
+            exit 1
+          }
+
+          grep -q 'function requestDeleteBill' index.html
+          grep -q 'function requestStatusChange' index.html
+          grep -q 'function shareInvoicePDF' index.html
+          grep -q 'function applyInvoiceFont' index.html
+
+      - name: Create Android Project
         run: |
           set -e
 
-          if [ -f index.html ]; then
-            echo "HTML already available."
-          else
-            ZIP=""
-
-            while IFS= read -r file; do
-              if unzip -l "$file" | grep -Eq '[[:space:]]index\.html$'; then
-                ZIP="$file"
-                break
-              fi
-            done < <(find . -type f -iname '*.zip' \
-              -not -path './.git/*' | sort)
-
-            if [ -z "$ZIP" ]; then
-              echo "::error::No ZIP containing index.html found."
-              exit 1
-            fi
-
-            echo "Extracting $ZIP"
-            mkdir -p extracted
-            unzip -o "$ZIP" -d extracted
-
-            HTML=$(find extracted -type f -name index.html | head -n 1)
-
-            if [ -z "$HTML" ]; then
-              echo "::error::index.html not found."
-              exit 1
-            fi
-
-            cp "$HTML" index.html
-          fi
-
-      - name: Fix Print Button
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          p = Path("index.html")
-          html = p.read_text(encoding="utf-8")
-
-          if "function printInvoice" not in html:
-              html, count = re.subn(
-                  r'onclick\s*=\s*(["\'])window\.print\(\)\1',
-                  'onclick="printInvoice()"',
-                  html,
-                  count=1,
-                  flags=re.I
-              )
-
-              if count == 0:
-                  raise SystemExit("Print button not found.")
-
-              helper = """
-          <script>
-          function printInvoice() {
-              if (window.AndroidPrint &&
-                  typeof window.AndroidPrint.printPage === 'function') {
-                  window.AndroidPrint.printPage();
-              } else {
-                  window.print();
-              }
-          }
-          </script>
-          """
-              html = helper + html
-
-          p.write_text(html, encoding="utf-8")
-          PY
-
-      - name: Verify Required Features
-        run: |
-          grep -q 'function unlockFontControls' index.html
-          grep -q 'function applyInvoiceFontSize' index.html
-          grep -q 'function requestDeleteBill' index.html
-          grep -q 'function requestStatusChange' index.html
-          echo "Feature verification completed."
-
-      - name: Generate Android Project
-        run: |
           mkdir -p app/src/main/assets
           mkdir -p app/src/main/java/com/gundrathy/invoicemanager
           mkdir -p app/src/main/res/values
+          mkdir -p app/src/main/res/xml
 
           cp index.html app/src/main/assets/index.html
 
@@ -138,8 +71,11 @@ jobs:
           }
           EOF
 
-          echo "org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8" > gradle.properties
-          echo "android.useAndroidX=true" >> gradle.properties
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          EOF
 
           cat > app/build.gradle <<'EOF'
           plugins {
@@ -154,14 +90,18 @@ jobs:
                   applicationId 'com.gundrathy.invoicemanager'
                   minSdk 23
                   targetSdk 35
-                  versionCode 4
-                  versionName '1.3'
+                  versionCode 5
+                  versionName '1.4'
               }
 
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
                   targetCompatibility JavaVersion.VERSION_17
               }
+          }
+
+          dependencies {
+              implementation 'androidx.core:core:1.13.1'
           }
           EOF
 
@@ -170,7 +110,19 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <application
                   android:label="Billing raghu"
+                  android:allowBackup="true"
                   android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="${applicationId}.provider"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths"/>
+                  </provider>
+
                   <activity
                       android:name=".MainActivity"
                       android:exported="true">
@@ -183,21 +135,42 @@ jobs:
           </manifest>
           EOF
 
+          cat > app/src/main/res/xml/file_paths.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths xmlns:android="http://schemas.android.com/apk/res/android">
+              <cache-path name="shared_pdfs" path="shared/"/>
+          </paths>
+          EOF
+
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <resources>
+              <style name="AppTheme"
+                  parent="@android:style/Theme.Material.Light.NoActionBar"/>
+          </resources>
+          EOF
+
           cat > app/src/main/java/com/gundrathy/invoicemanager/MainActivity.java <<'EOF'
           package com.gundrathy.invoicemanager;
 
           import android.app.Activity;
           import android.os.Bundle;
           import android.content.Context;
+          import android.content.Intent;
           import android.content.SharedPreferences;
+          import android.net.Uri;
           import android.print.PrintAttributes;
           import android.print.PrintManager;
+          import android.util.Base64;
           import android.webkit.JavascriptInterface;
           import android.webkit.WebSettings;
           import android.webkit.WebView;
           import android.webkit.WebViewClient;
+          import androidx.core.content.FileProvider;
+          import java.io.File;
+          import java.io.FileOutputStream;
 
           public class MainActivity extends Activity {
+
               WebView webView;
               SharedPreferences storage;
 
@@ -238,9 +211,55 @@ jobs:
                               new PrintAttributes.Builder()
                                   .setMediaSize(
                                       PrintAttributes.MediaSize.ISO_A4)
-                                  .setMinMargins(
-                                      PrintAttributes.Margins.NO_MARGINS)
                                   .build());
+                      });
+                  }
+              }
+
+              public class AndroidShare {
+                  @JavascriptInterface
+                  public void sharePdf(String data, String name) {
+                      runOnUiThread(() -> {
+                          try {
+                              byte[] bytes =
+                                  Base64.decode(data, Base64.DEFAULT);
+
+                              File dir = new File(
+                                  getCacheDir(), "shared");
+                              dir.mkdirs();
+
+                              File file = new File(
+                                  dir, name.replaceAll(
+                                      "[^A-Za-z0-9._-]", "_"));
+
+                              try (FileOutputStream out =
+                                  new FileOutputStream(file)) {
+                                  out.write(bytes);
+                              }
+
+                              Uri uri = FileProvider.getUriForFile(
+                                  MainActivity.this,
+                                  getPackageName() + ".provider",
+                                  file);
+
+                              Intent send =
+                                  new Intent(Intent.ACTION_SEND);
+
+                              send.setType("application/pdf");
+                              send.putExtra(Intent.EXTRA_STREAM, uri);
+                              send.addFlags(
+                                  Intent.FLAG_GRANT_READ_URI_PERMISSION);
+
+                              startActivity(Intent.createChooser(
+                                  send, "Share invoice PDF"));
+
+                          } catch (Exception e) {
+                              android.widget.Toast.makeText(
+                                  MainActivity.this,
+                                  "PDF sharing failed",
+                                  android.widget.Toast.LENGTH_LONG
+                              ).show();
+                          }
                       });
                   }
               }
@@ -250,7 +269,8 @@ jobs:
                   super.onCreate(state);
 
                   storage = getSharedPreferences(
-                      "billing_raghu_invoice_data", MODE_PRIVATE);
+                      "billing_raghu_invoice_data",
+                      MODE_PRIVATE);
 
                   webView = new WebView(this);
                   setContentView(webView);
@@ -258,7 +278,6 @@ jobs:
                   WebSettings settings = webView.getSettings();
                   settings.setJavaScriptEnabled(true);
                   settings.setDomStorageEnabled(true);
-                  settings.setDatabaseEnabled(true);
 
                   webView.addJavascriptInterface(
                       new AndroidStorage(), "AndroidStorage");
@@ -266,17 +285,24 @@ jobs:
                   webView.addJavascriptInterface(
                       new AndroidPrint(), "AndroidPrint");
 
+                  webView.addJavascriptInterface(
+                      new AndroidShare(), "AndroidShare");
+
                   webView.setWebViewClient(new WebViewClient());
-                  webView.loadUrl("file:///android_asset/index.html");
+
+                  webView.loadUrl(
+                      "file:///android_asset/index.html");
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (webView != null && webView.canGoBack()) {
+                      webView.goBack();
+                  } else {
+                      super.onBackPressed();
+                  }
               }
           }
-          EOF
-
-          cat > app/src/main/res/values/styles.xml <<'EOF'
-          <resources>
-              <style name="AppTheme"
-                  parent="@android:style/Theme.Material.Light.NoActionBar"/>
-          </resources>
           EOF
 
       - name: Setup Gradle
@@ -290,6 +316,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Billing-Raghu-APK
+          name: Billing-Raghu-APK-v1.4
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+          retention-days: 30
