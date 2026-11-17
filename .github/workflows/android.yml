@@ -3,8 +3,7 @@ name: Build Billing raghu APK
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [ main ]
 
 permissions:
   contents: read
@@ -14,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Java 17
@@ -23,42 +22,94 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Extract Storage Fix ZIP
+      - name: Automatically Extract ZIP and Fix Printing
         shell: bash
         run: |
-          ZIP=$(find . -type f \
-            -name "Billing_Raghu_Storage_Fix_GitHub.zip" \
-            -not -path "./.git/*" | head -n 1)
+          set -e
 
-          if [ -z "$ZIP" ]; then
-            echo "::error::Storage Fix ZIP not found."
-            find . -maxdepth 3 -type f
-            exit 1
+          if [ ! -f index.html ]; then
+            ZIP=""
+
+            while IFS= read -r candidate; do
+              if unzip -l "$candidate" | grep -Eq '[[:space:]]index\.html$'; then
+                ZIP="$candidate"
+                break
+              fi
+            done < <(find . -type f -name '*.zip' -not -path './.git/*' | sort)
+
+            if [ -z "$ZIP" ]; then
+              echo "::error::No ZIP containing index.html found."
+              exit 1
+            fi
+
+            echo "Extracting: $ZIP"
+
+            mkdir -p extracted
+            unzip -o "$ZIP" -d extracted
+
+            HTML="$(find extracted -type f -name index.html | head -n 1)"
+
+            if [ -z "$HTML" ]; then
+              echo "::error::index.html not found inside ZIP."
+              exit 1
+            fi
+
+            cp "$HTML" index.html
           fi
 
-          mkdir extracted
-          unzip -o "$ZIP" -d extracted
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
 
-          HTML=$(find extracted -type f -name index.html | head -n 1)
+          p = Path("index.html")
+          html = p.read_text(encoding="utf-8")
 
-          if [ -z "$HTML" ]; then
-            echo "::error::Updated index.html not found inside ZIP."
-            exit 1
-          fi
+          if "function printInvoice" not in html:
+              html, count = re.subn(
+                  r'onclick\s*=\s*(["\'])window\.print\(\)\1',
+                  'onclick="printInvoice()"',
+                  html,
+                  count=1,
+                  flags=re.I
+              )
 
-          mkdir -p website
-          cp "$HTML" website/index.html
+              if count == 0:
+                  raise SystemExit(
+                      "Print / Save PDF button not found. "
+                      "Check the HTML inside your ZIP."
+                  )
 
-          echo "Storage-fixed website extracted successfully."
+              helper = """
+          <script>
+          function printInvoice() {
+              try {
+                  if (window.AndroidPrint &&
+                      typeof window.AndroidPrint.printPage === "function") {
+                      window.AndroidPrint.printPage();
+                      return;
+                  }
+              } catch (e) {}
+              window.print();
+          }
+          </script>
+          """
 
-      - name: Create Android Project
+              html = helper + html
+              p.write_text(html, encoding="utf-8")
+
+          print("Print button fix completed.")
+          PY
+
+      - name: Generate Android Project
         shell: bash
         run: |
+          set -e
+
           mkdir -p app/src/main/assets
           mkdir -p app/src/main/java/com/gundrathy/invoicemanager
           mkdir -p app/src/main/res/values
 
-          cp website/index.html app/src/main/assets/index.html
+          cp index.html app/src/main/assets/index.html
 
           cat > settings.gradle <<'EOF'
           pluginManagement {
@@ -68,6 +119,7 @@ jobs:
                   gradlePluginPortal()
               }
           }
+
           dependencyResolutionManagement {
               repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
               repositories {
@@ -75,6 +127,7 @@ jobs:
                   mavenCentral()
               }
           }
+
           rootProject.name = "BillingRaghu"
           include(":app")
           EOF
@@ -104,8 +157,8 @@ jobs:
                   applicationId 'com.gundrathy.invoicemanager'
                   minSdk 23
                   targetSdk 35
-                  versionCode 2
-                  versionName '1.1'
+                  versionCode 3
+                  versionName '1.2'
               }
 
               compileOptions {
@@ -118,17 +171,22 @@ jobs:
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
               <application
                   android:allowBackup="true"
                   android:label="Billing raghu"
                   android:theme="@style/AppTheme">
+
                   <activity
                       android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden"
                       android:exported="true">
+
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN"/>
                           <category android:name="android.intent.category.LAUNCHER"/>
                       </intent-filter>
+
                   </activity>
               </application>
           </manifest>
@@ -138,9 +196,11 @@ jobs:
           <resources>
               <style name="AppTheme"
                   parent="@android:style/Theme.Material.Light.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
                   <item name="android:colorAccent">#B02610</item>
                   <item name="android:statusBarColor">#182235</item>
                   <item name="android:navigationBarColor">#182235</item>
+                  <item name="android:windowLightStatusBar">false</item>
               </style>
           </resources>
           EOF
@@ -150,17 +210,22 @@ jobs:
 
           import android.app.Activity;
           import android.os.Bundle;
+          import android.content.Context;
           import android.content.SharedPreferences;
+          import android.print.PrintAttributes;
+          import android.print.PrintManager;
           import android.webkit.JavascriptInterface;
           import android.webkit.WebSettings;
           import android.webkit.WebView;
           import android.webkit.WebViewClient;
 
           public class MainActivity extends Activity {
+
               private WebView webView;
               private SharedPreferences storage;
 
               public class AndroidStorage {
+
                   @JavascriptInterface
                   public String getItem(String key) {
                       return storage.getString(key, null);
@@ -182,12 +247,55 @@ jobs:
                   }
               }
 
+              public class AndroidPrint {
+
+                  @JavascriptInterface
+                  public void printPage() {
+                      runOnUiThread(() -> {
+
+                          if (webView == null) return;
+
+                          PrintManager printManager =
+                              (PrintManager) getSystemService(
+                                  Context.PRINT_SERVICE
+                              );
+
+                          String jobName = "Billing raghu Invoice";
+
+                          android.print.PrintDocumentAdapter adapter =
+                              webView.createPrintDocumentAdapter(jobName);
+
+                          PrintAttributes attributes =
+                              new PrintAttributes.Builder()
+                                  .setMediaSize(
+                                      PrintAttributes.MediaSize.ISO_A4
+                                  )
+                                  .setResolution(
+                                      new PrintAttributes.Resolution(
+                                          "pdf", "PDF", 300, 300
+                                      )
+                                  )
+                                  .setMinMargins(
+                                      PrintAttributes.Margins.NO_MARGINS
+                                  )
+                                  .build();
+
+                          printManager.print(
+                              jobName,
+                              adapter,
+                              attributes
+                          );
+                      });
+                  }
+              }
+
               @Override
-              protected void onCreate(Bundle savedInstanceState) {
+              public void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
 
                   storage = getSharedPreferences(
-                      "billing_raghu_invoice_data", MODE_PRIVATE
+                      "billing_raghu_invoice_data",
+                      MODE_PRIVATE
                   );
 
                   webView = new WebView(this);
@@ -196,14 +304,25 @@ jobs:
                   WebSettings settings = webView.getSettings();
                   settings.setJavaScriptEnabled(true);
                   settings.setDomStorageEnabled(true);
+                  settings.setDatabaseEnabled(true);
                   settings.setAllowFileAccess(true);
+                  settings.setAllowContentAccess(true);
 
                   webView.addJavascriptInterface(
-                      new AndroidStorage(), "AndroidStorage"
+                      new AndroidStorage(),
+                      "AndroidStorage"
+                  );
+
+                  webView.addJavascriptInterface(
+                      new AndroidPrint(),
+                      "AndroidPrint"
                   );
 
                   webView.setWebViewClient(new WebViewClient());
-                  webView.loadUrl("file:///android_asset/index.html");
+
+                  webView.loadUrl(
+                      "file:///android_asset/index.html"
+                  );
               }
 
               @Override
@@ -214,6 +333,15 @@ jobs:
                       super.onBackPressed();
                   }
               }
+
+              @Override
+              protected void onDestroy() {
+                  if (webView != null) {
+                      webView.destroy();
+                      webView = null;
+                  }
+                  super.onDestroy();
+              }
           }
           EOF
 
@@ -222,13 +350,13 @@ jobs:
         with:
           gradle-version: '8.7'
 
-      - name: Build Billing raghu APK
+      - name: Build APK
         run: gradle --no-daemon assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Billing-raghu-APK-v1.1
+          name: Billing-raghu-APK-v1.2-Print-Fix
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
