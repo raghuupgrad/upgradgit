@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Java 17
@@ -22,20 +22,54 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Check uploaded HTML
+      # STEP 1: Find ZIP and extract automatically
+      - name: Find and Extract ZIP
+        shell: bash
         run: |
           set -e
-          test -f index.html || {
-            echo "::error::Upload index.html to the repository root."
+
+          echo "Searching for uploaded ZIP files..."
+
+          ZIP=""
+
+          while IFS= read -r file; do
+            if unzip -l "$file" | grep -Eqi '(^|[[:space:]])index\.html$'; then
+              ZIP="$file"
+              break
+            fi
+          done < <(find . -type f -iname '*.zip' \
+            -not -path './.git/*' \
+            -not -path './extracted/*' | sort)
+
+          if [ -z "$ZIP" ]; then
+            echo "::error::No ZIP containing index.html found."
+            echo "Files available in repository:"
+            find . -maxdepth 5 -type f
             exit 1
-          }
+          fi
 
-          grep -q 'function requestDeleteBill' index.html
-          grep -q 'function requestStatusChange' index.html
-          grep -q 'function shareInvoicePDF' index.html
-          grep -q 'function applyInvoiceFont' index.html
+          echo "ZIP found: $ZIP"
 
-      - name: Create Android Project
+          mkdir -p extracted
+
+          unzip -o "$ZIP" -d extracted
+
+          HTML=$(find extracted -type f -iname 'index.html' | head -n 1)
+
+          if [ -z "$HTML" ]; then
+            echo "::error::index.html not found inside ZIP."
+            exit 1
+          fi
+
+          echo "HTML found: $HTML"
+
+          cp "$HTML" index.html
+
+          echo "ZIP extraction completed."
+
+      # STEP 2: Generate Android project
+      - name: Generate Android Project
+        shell: bash
         run: |
           set -e
 
@@ -54,6 +88,7 @@ jobs:
                   gradlePluginPortal()
               }
           }
+
           dependencyResolutionManagement {
               repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
               repositories {
@@ -61,6 +96,7 @@ jobs:
                   mavenCentral()
               }
           }
+
           rootProject.name = "BillingRaghu"
           include(":app")
           EOF
@@ -90,8 +126,8 @@ jobs:
                   applicationId 'com.gundrathy.invoicemanager'
                   minSdk 23
                   targetSdk 35
-                  versionCode 5
-                  versionName '1.4'
+                  versionCode 6
+                  versionName '1.5'
               }
 
               compileOptions {
@@ -108,6 +144,7 @@ jobs:
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
               <application
                   android:label="Billing raghu"
                   android:allowBackup="true"
@@ -118,6 +155,7 @@ jobs:
                       android:authorities="${applicationId}.provider"
                       android:exported="false"
                       android:grantUriPermissions="true">
+
                       <meta-data
                           android:name="android.support.FILE_PROVIDER_PATHS"
                           android:resource="@xml/file_paths"/>
@@ -126,10 +164,12 @@ jobs:
                   <activity
                       android:name=".MainActivity"
                       android:exported="true">
+
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN"/>
                           <category android:name="android.intent.category.LAUNCHER"/>
                       </intent-filter>
+
                   </activity>
               </application>
           </manifest>
@@ -305,6 +345,7 @@ jobs:
           }
           EOF
 
+      # STEP 3: Build APK
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
@@ -313,10 +354,11 @@ jobs:
       - name: Build APK
         run: gradle --no-daemon assembleDebug
 
+      # STEP 4: Download APK
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Billing-Raghu-APK-v1.4
+          name: Billing-Raghu-APK-v1.5
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
